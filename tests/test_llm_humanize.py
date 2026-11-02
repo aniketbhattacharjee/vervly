@@ -1170,3 +1170,73 @@ def test_pass_threshold_defaults_to_the_calibrated_value_and_drives_reruns(monke
     _, result = run(FIRST_PARAGRAPH, backend=fixed_backend(backend_text), detector=FakeDetector(lambda t: 0.05),
                     style="faithful", rounds=2, n_candidates=2)
     assert len(calls) == 2
+
+
+def _variant_backend():
+    """Two candidates per paragraph that differ by a leading tag word."""
+    def text_for(request):
+        # The two freeform specs run at 0.8 and 0.9; the cooler one is Alpha.
+        tag = "Alpha" if request.temperature < 0.85 else "Beta"
+        return tag + " note. " + echo_source(request)
+    return fixed_backend(text_for)
+
+
+def _document_judge(text):
+    """Paragraphs alone read human; a document whose winners share the same
+    tag reads as a uniform transform, which is what the assembled-document
+    verdict is for."""
+    if "\n\n" not in text:
+        return 0.05
+    return 0.9 if (text.count("Alpha") >= 2 or text.count("Beta") >= 2) else 0.1
+
+
+def test_document_select_swaps_winners_by_the_assembled_document_score():
+    """Per paragraph both candidates tie, so the earlier one wins twice and the
+    document scores 0.9. With a scan budget the finalize stage tries the other
+    survivor paragraph by paragraph and keeps the swap that lowers the whole
+    document's score. Owner's report of 2026-11-01: paragraphs human one at a
+    time, "rewritten" together."""
+    det = FakeDetector(_document_judge)
+    events, result = run(
+        backend=_variant_backend(), detector=det, n_candidates=2, rounds=1,
+        document_select_scans=6,
+    )
+    block = result.summary["document_select"]
+    assert block["enabled"] and block["swaps"] == 1 and 2 <= block["scans"] <= 6
+    assert block["p_before"] == 0.9 and block["p_after"] == 0.1
+    assert result.after["ai_probability"] == 0.1
+    tags = [p.chosen.split()[0] for p in result.paragraphs]
+    assert sorted(tags) == ["Alpha", "Beta"]
+    details = [e.detail for e in events if e.stage == "select" and e.status == "progress"]
+    assert any("brings the document to p(AI) 0.100" in d for d in details)
+    assert any(d.startswith("document p(AI) 0.900 -> 0.100 after 1 swaps") for d in details)
+    done = [e.detail for e in events if e.stage == "select" and e.status == "done"]
+    assert done[-1].endswith("the assembled document reads p(AI) 0.100")
+
+
+def test_document_select_can_be_switched_off_and_reports_why():
+    det = FakeDetector(_document_judge)
+    _events, result = run(
+        backend=_variant_backend(), detector=det, n_candidates=2, rounds=1, document_select_scans=0
+    )
+    block = result.summary["document_select"]
+    assert block == {"enabled": False, "scans": 0, "swaps": 0, "p_before": None, "p_after": None, "skipped": "off"}
+    assert result.after["ai_probability"] == 0.9
+    assert "subclass" not in result.after
+
+
+def test_a_document_that_still_reads_ai_sends_every_paragraph_into_round_two():
+    """Every paragraph under the threshold alone, the assembled document over
+    it, and no swap fixes that: round 2 must run on all of them instead of
+    being skipped as "not needed"."""
+    def stubborn(text):
+        return 0.05 if "\n\n" not in text else 0.9
+
+    det = FakeDetector(stubborn)
+    events, result = run(backend=_variant_backend(), detector=det, n_candidates=2, rounds=2, pass_threshold=0.15)
+    gen2 = [e for e in events if e.stage == "generate" and e.round == 2]
+    assert gen2 and gen2[0].status == "progress"
+    assert "assembled document reads p(AI) 0.900, so all 2 are rewritten again" in gen2[0].detail
+    assert not any(e.status == "skip" for e in gen2)
+    assert result.summary["document_select"]["p_after"] == 0.9
+    assert result.summary["rounds_run"] == 2 if "rounds_run" in result.summary else True

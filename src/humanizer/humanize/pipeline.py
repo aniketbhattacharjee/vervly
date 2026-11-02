@@ -682,6 +682,22 @@ class PipelineConfig:
     #: Independent floor, stated separately because it is the failure that
     #: matters most: a candidate that silently drops half the paragraph.
     min_length_ratio: Optional[float] = None
+    #: Document-level selection at finalize. The per-paragraph judge never
+    #: sees what GPTZero sees: the owner found (2026-11-01) that paragraphs
+    #: read as human one at a time while the joined document read as "AI,
+    #: rewritten", and the cache agrees (that verdict is 0% under 80 words,
+    #: 13-18% at 80-300). With a budget here the yardstick scores the
+    #: *assembled* document and swaps in alternative passing candidates
+    #: while that score falls, up to this many scans. The gates are not
+    #: revisited, so faithfulness is unchanged. Measured 2026-11-01 with the
+    #: surrogate judging three 400-word essays (.docbench): per-paragraph
+    #: winners assembled to 0.998, 0.683 and 0.010; with 24 scans every
+    #: essay ended under the threshold (0.093, 0.142, 0.008) at no extra wall
+    #: time. 0 restores per-paragraph selection. Override with
+    #: HUMANIZER_DOC_SELECT_SCANS.
+    document_select_scans: int = field(
+        default_factory=lambda: int(os.environ.get("HUMANIZER_DOC_SELECT_SCANS") or 24)
+    )
     model: Optional[str] = None
     #: Names, dates, figures and sources the *author* vouches for, as free
     #: text. This is the only legitimate source of specifics a rewrite may
@@ -859,6 +875,23 @@ def _score_and_label(text: str, detector: Any) -> Tuple[Optional[float], Optiona
     return probability, label
 
 
+def _subclass_of(result: Any) -> Optional[str]:
+    """GPTZero's nested verdict (`pure_ai`, `ai_paraphrased`, ...), if any.
+
+    research/07: the document head is a three-way softmax; the AI class
+    carries a subclass head that names humanizer output. The label alone
+    hides it, and it is the verdict the owner is asked about.
+    """
+    raw = getattr(result, "raw", None) or {}
+    sub = raw.get("subclass") if isinstance(raw, dict) else None
+    if not isinstance(sub, dict):
+        return None
+    for branch in sub.values():
+        if isinstance(branch, dict) and branch.get("predicted_class"):
+            return str(branch["predicted_class"])
+    return None
+
+
 def _label(probability: Optional[float]) -> Optional[str]:
     if probability is None:
         return None
@@ -1018,6 +1051,20 @@ def _paragraph_segments(text: str) -> List[str]:
     return parts or ([text.strip()] if text.strip() else [])
 
 
+def _subclass_from_cache(text: str, detector: Any) -> Optional[str]:
+    """The subclass of the verdict `_score_and_label` just fetched.
+
+    A second `score()` call: GPTZero's client caches by text, so this costs
+    nothing there, and the local detectors carry no subclass at all.
+    """
+    if detector is None or not getattr(detector, "name", "") == "gptzero":
+        return None
+    try:
+        return _subclass_of(detector.score(text))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _measure(text: str, detector: Any) -> Dict[str, Any]:
     """The `before`/`after` block: feature vector plus the yardstick's verdict.
 
@@ -1033,6 +1080,9 @@ def _measure(text: str, detector: Any) -> Dict[str, Any]:
         "label": label,
         "features": extract_from_document(doc),
     }
+    subclass = _subclass_from_cache(text, detector)
+    if subclass:
+        block["subclass"] = subclass
     if isinstance(detector, yardstick_mod.Yardstick):
         block["yardstick"] = {
             "name": detector.name,
@@ -1228,6 +1278,11 @@ def stream(
     used_batching = False
     backend_error: Optional[str] = None
 
+    document_select: Dict[str, Any] = {
+        "enabled": False, "scans": 0, "swaps": 0, "p_before": None, "p_after": None, "skipped": "no round ran",
+    }
+    document_p: Optional[float] = None
+
     for rnd in range(1, max(1, cfg.rounds) + 1):
         targets = [
             o
@@ -1239,6 +1294,23 @@ def stream(
                 and o.ai_probability_after >= cfg.pass_threshold
             )
         ]
+        if rnd > 1 and not targets and document_p is not None and document_p >= cfg.pass_threshold:
+            # Every paragraph passed on its own and the assembled document did
+            # not (owner's case, 2026-11-01). The next round re-runs them all,
+            # worst first; the enlarged pool is then re-picked by the
+            # document's score.
+            targets = sorted(
+                outcomes,
+                key=lambda o: -(o.ai_probability_after if o.ai_probability_after is not None else 1.0),
+            )
+            yield event(
+                "generate",
+                "progress",
+                0.0,
+                "round %d: every paragraph passed alone but the assembled document reads "
+                "p(AI) %.3f, so all %d are rewritten again" % (rnd, document_p, len(targets)),
+                rnd,
+            )
         if rnd > 1:
             if not targets:
                 yield event(
@@ -1620,14 +1692,17 @@ def stream(
                 ),
                 rnd,
             )
+        document_select = yield from _document_select(outcomes, yard, cfg, event, rnd=rnd)
+        document_p = document_select.get("p_after")
         yield event(
             "select",
             "done",
             1.0,
-            "%d of %s rewritten"
+            "%d of %s rewritten%s"
             % (
                 sum(1 for o in outcomes if o.changed),
                 _plural(len(outcomes), "paragraph"),
+                "" if document_p is None else "; the assembled document reads p(AI) %.3f" % document_p,
             ),
             rnd,
         )
@@ -1651,7 +1726,7 @@ def stream(
 
     # -- finalize ---------------------------------------------------------
     yield event("finalize", "start", 0.0, "reassembling and re-measuring")
-    humanized = "\n\n".join(o.chosen.strip() for o in outcomes if o.chosen.strip())
+    humanized = _assemble(outcomes)
     after = _measure(humanized, yard)
     p_after = after["ai_probability"]
     all_candidates = [c for o in outcomes for c in o.candidates]
@@ -1699,6 +1774,9 @@ def stream(
         "gate_rejections": _rejection_counts(all_candidates),
         "paragraphs_rewritten": sum(1 for o in outcomes if o.changed),
         "paragraphs_unchanged": sum(1 for o in outcomes if not o.changed),
+        # Document-level selection (`document_select_scans`): what the
+        # assembled document scored before and after swapping winners.
+        "document_select": document_select,
         "facts_supplied": bool(cfg.facts and cfg.facts.strip()),
         "voice": _voice_summary(cfg, outcomes),
         # Union over paragraphs, in order, of what the rejected best candidates
@@ -1811,6 +1889,117 @@ def _voice_distance(candidate: Candidate, cfg: PipelineConfig) -> float:
     d = voice_mod.profile_distance(profile, candidate.scrubbed)
     candidate.quality["voice_distance"] = round(d, 4)
     return d
+
+
+def _assemble(outcomes: Sequence[ParagraphOutcome]) -> str:
+    """The document as shipped: the chosen paragraphs, blank-line separated."""
+    return "\n\n".join(o.chosen.strip() for o in outcomes if o.chosen.strip())
+
+
+def _document_select(
+    outcomes: List[ParagraphOutcome],
+    yard: Any,
+    cfg: PipelineConfig,
+    event: Callable[..., ProgressEvent],
+    rnd: int = 1,
+) -> Iterator[ProgressEvent]:
+    """Re-pick winners by the score of the *assembled* document.
+
+    Per-paragraph selection optimises each paragraph alone, which is not
+    what a detector reads: it reads the whole document, and GPTZero's
+    "AI, rewritten" verdict only appears once there is enough of it
+    (2026-11-01 cache: never under 80 words, 13-18% at 80-300). Starting
+    from the per-paragraph winners, the worst-scoring paragraph first,
+    each alternative candidate that passed every gate is tried in place and
+    kept when the yardstick's score for the whole document falls. One
+    accepted swap per paragraph per pass, within `cfg.document_select_scans`
+    yardstick calls. Runs at the end of each round's select stage, so a
+    document that still reads AI can send every paragraph into the next
+    round. Returns the summary block; yields select-stage progress.
+    """
+    budget = int(cfg.document_select_scans or 0)
+    summary: Dict[str, Any] = {
+        "enabled": budget > 0,
+        "scans": 0,
+        "swaps": 0,
+        "p_before": None,
+        "p_after": None,
+        "skipped": None,
+    }
+    if budget <= 0:
+        summary["skipped"] = "off"
+        return summary
+    if yard is None:
+        summary["skipped"] = "no yardstick"
+        return summary
+    alternatives: Dict[int, List[Candidate]] = {}
+    for o in outcomes:
+        alts = [
+            c
+            for c in o.candidates
+            if c.passed
+            and c.paragraph_index == o.index
+            and c.index != o.chosen_index
+            and c.scrubbed.strip()
+            and c.scrubbed.strip() != o.chosen.strip()
+        ]
+        alts.sort(key=lambda c: (c.ai_probability if c.ai_probability is not None else 1.0, c.index))
+        if alts:
+            alternatives[o.index] = alts
+    if len(outcomes) < 2 or not alternatives:
+        summary["skipped"] = "one paragraph" if len(outcomes) < 2 else "no alternative passed the gates"
+        return summary
+    p0 = _score(_assemble(outcomes), yard)
+    scans = 1
+    if p0 is None:
+        summary["skipped"] = "yardstick unavailable"
+        summary["scans"] = scans
+        return summary
+    current = p0
+    swaps = 0
+    yield event(
+        "select",
+        "progress",
+        1.0,
+        "assembled document p(AI) %.3f; trying other survivors within %d scans" % (p0, budget),
+        rnd,
+    )
+    order = sorted(
+        (o for o in outcomes if o.index in alternatives),
+        key=lambda o: -(o.ai_probability_after if o.ai_probability_after is not None else 1.0),
+    )
+    for o in order:
+        if scans >= budget:
+            break
+        for c in alternatives[o.index]:
+            if scans >= budget:
+                break
+            keep = (o.chosen, o.chosen_index, o.ai_probability_after)
+            o.chosen, o.chosen_index, o.ai_probability_after = c.scrubbed, c.index, c.ai_probability
+            p = _score(_assemble(outcomes), yard)
+            scans += 1
+            if p is not None and p < current - 1e-9:
+                current = p
+                swaps += 1
+                yield event(
+                    "select",
+                    "progress",
+                    1.0,
+                    "paragraph %d: candidate %d brings the document to p(AI) %.3f"
+                    % (o.index + 1, c.index + 1, p),
+                    rnd,
+                )
+                break
+            o.chosen, o.chosen_index, o.ai_probability_after = keep
+    yield event(
+        "select",
+        "progress",
+        1.0,
+        "document p(AI) %.3f -> %.3f after %d swaps in %d scans" % (p0, current, swaps, scans),
+        rnd,
+    )
+    summary.update({"scans": scans, "swaps": swaps, "p_before": p0, "p_after": current})
+    return summary
 
 
 def _select_scored(scored: Sequence[Candidate], cfg: PipelineConfig) -> Candidate:
