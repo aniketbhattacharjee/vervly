@@ -49,7 +49,7 @@ titles never show there, so no change is required.
 
 At 1024px wide the three footer columns share one row with 112px gaps. The
 contact column gets about 200px and the GitHub link
-(`github.com/aniketbhattacharjee08-ui`, 259px at 16px) cannot break, so the
+(`github.com/aniketbhattacharjee`, 259px at 16px) cannot break, so the
 page grows to 1033px and scrolls sideways (this is what widened the
 viewport in the 1024 x 768 screenshot). styles.css carries a stopgap,
 `.shell .site-foot-col a { overflow-wrap: anywhere; }`, which lets the

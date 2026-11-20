@@ -3,7 +3,7 @@
 # boot, then serve. The weights (480MB) ship in the GitHub release so the
 # image stays small and the volume keeps them across deploys.
 set -eu
-WEIGHTS_URL=${VERVLY_WEIGHTS_URL:-https://github.com/aniketbhattacharjee08-ui/firsthand/releases/download/v0.1.0/firsthand-weights.zip}
+WEIGHTS_URL=${VERVLY_WEIGHTS_URL:-https://github.com/aniketbhattacharjee/vervly/releases/download/v0.1.0/firsthand-weights.zip}
 mkdir -p /data/cache/models /data/logs /data/backups
 if [ ! -f /data/cache/models/gptzero-surrogate/model.safetensors ]; then
   echo "[entrypoint] downloading surrogate weights"

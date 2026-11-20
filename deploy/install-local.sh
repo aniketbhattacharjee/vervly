@@ -31,7 +31,7 @@ PY
 mkdir -p data/cache/models data/reference
 if [ -d data/cache/models/gptzero-surrogate ]; then echo "== free detector present"; else
   echo "== downloading the free detector (480 MB) from the GitHub release"
-  curl -L -o firsthand-weights.zip https://github.com/aniketbhattacharjee08-ui/firsthand/releases/download/v0.1.0/firsthand-weights.zip \
+  curl -L -o firsthand-weights.zip https://github.com/aniketbhattacharjee/vervly/releases/download/v0.1.0/firsthand-weights.zip \
     && unzip -oq firsthand-weights.zip && rm -f firsthand-weights.zip && echo "== free detector installed" \
     || echo "== could not download the detector; the app still rewrites, without the free reading"
 fi

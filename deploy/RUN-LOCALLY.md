@@ -16,7 +16,7 @@ key.
 ## Install
 
 ```bash
-git clone https://github.com/aniketbhattacharjee08-ui/firsthand.git firsthand
+git clone https://github.com/aniketbhattacharjee/vervly.git firsthand
 cd firsthand
 sh deploy/install-local.sh
 ```
@@ -31,7 +31,7 @@ The trained adapter that makes the 7B base pass detectors ships in the repo at
 `data/adapters/hip7b-r4-it200`. The free detector, a 480 MB model trained on
 GPTZero verdicts, is too large for git; the installer downloads it from the
 repository's release page
-(https://github.com/aniketbhattacharjee08-ui/firsthand/releases) and unpacks
+(https://github.com/aniketbhattacharjee/vervly/releases) and unpacks
 it to `data/cache/models/gptzero-surrogate/`. Without it the app still
 rewrites, but shows no free reading; a user's own GPTZero key still works.
 
